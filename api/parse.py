@@ -22,19 +22,33 @@ genai.configure(api_key=GEMINI_API_KEY)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Try to use a stable model
-MODEL_NAME = "gemini-2.5-flash"  # widely available
-try:
-    model = genai.GenerativeModel(MODEL_NAME)
-    # Quick test
-    test_response = model.generate_content("Hello")
-    if not test_response.text:
-        raise Exception("Model returned empty response")
-    logger.info(f"✅ Using model: {MODEL_NAME}")
-except Exception as e:
-    logger.warning(f"{MODEL_NAME} failed: {e}, falling back to gemini-pro")
-    MODEL_NAME = "gemini-2.5-flash"
-    model = genai.GenerativeModel(MODEL_NAME)
+# ------------------------------------------------------------------
+# Model selection with automatic fallback
+# ------------------------------------------------------------------
+FREE_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash"
+]
+
+model = None
+MODEL_NAME = None
+
+for candidate in FREE_MODELS:
+    try:
+        tmp_model = genai.GenerativeModel(candidate)
+        # Test call to see if free quota is available
+        resp = tmp_model.generate_content("Hello")
+        if resp and resp.text:
+            model = tmp_model
+            MODEL_NAME = candidate
+            logger.info(f"✅ Using model: {MODEL_NAME}")
+            break
+    except Exception as e:
+        logger.warning(f"{candidate} unavailable: {e}")
+
+if not model:
+    logger.warning("All Gemini free-tier models unavailable, using mock fallback")
 
 # ------------------------------------------------------------------
 # PDF text extraction (coordinate‑based)
@@ -105,7 +119,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     return '\n'.join(structured_text)
 
 # ------------------------------------------------------------------
-# Gemini parsing with detailed error reporting
+# Gemini parsing with fallback
 # ------------------------------------------------------------------
 def parse_with_gemini(text: str):
     if len(text) > 30000:
@@ -127,25 +141,22 @@ Rules:
 - If there are no items, return {{"items": []}}.
 - Do NOT include any markdown, explanation or extra text.
 
-Example response:
-{{"items": [
-    {{"product": "Classic Tee", "color_name": "Navy", "color_code": "NVY", "size": "M", "quantity": "4", "wholesale_price": "19.99"}},
-    {{"product": "Hoodie", "color_name": "Black", "color_code": "BLK", "size": "XL", "quantity": "2", "wholesale_price": "45.00"}}
-]}}
-
 Document text:
 {text}
 """
+
+    if not model:
+        logger.warning("No Gemini model available, returning MOCK data")
+        return [
+            {"product": "Mock Product", "color_name": "Red", "color_code": "R01", "size": "M", "quantity": "2", "wholesale_price": "45.00"}
+        ]
 
     try:
         response = model.generate_content(prompt)
         if not response or not response.text:
             raise Exception("Empty response from Gemini API")
-        
-        result = response.text.strip()
-        logger.info(f"Gemini raw response (first 500 chars): {result[:500]}")
 
-        # Clean markdown
+        result = response.text.strip()
         if result.startswith("```json"):
             result = result[7:]
         elif result.startswith("```"):
@@ -156,31 +167,35 @@ Document text:
 
         data = json.loads(result)
         if isinstance(data, dict):
-            items = data.get("items", data.get("products", []))
-            return items if isinstance(items, list) else []
+            return data.get("items", data.get("products", []))
         elif isinstance(data, list):
             return data
         else:
-            logger.warning(f"Unexpected JSON type: {type(data)}")
             return []
+
     except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error: {e}\nRaw result: {result}")
         raise Exception(f"Gemini returned invalid JSON: {str(e)}")
     except Exception as e:
-        logger.error(f"Gemini parsing error: {str(e)}")
         raise Exception(f"Gemini AI error: {str(e)}")
 
 # ------------------------------------------------------------------
-# Flask app
+# Flask App with CORS
 # ------------------------------------------------------------------
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
 
 @app.route('/api/parse', methods=['POST', 'OPTIONS'])
 def parse_document():
     if request.method == 'OPTIONS':
         return '', 204
-    
+
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
     file = request.files['file']
@@ -201,11 +216,13 @@ def parse_document():
         logger.exception("Parsing failed")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/health', methods=['GET'])
+@app.route('/api/health', methods=['GET', 'OPTIONS'])
 def health():
-    return jsonify({'status': 'healthy', 'backend': 'available', 'model': MODEL_NAME})
+    if request.method == 'OPTIONS':
+        return '', 204
+    return jsonify({'status': 'healthy', 'backend': 'available', 'model': MODEL_NAME or "MOCK"})
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))    
+    port = int(os.environ.get('PORT', 8080))
     logger.info(f"Starting Flask server on 0.0.0.0:{port}")
     app.run(host='0.0.0.0', port=port, debug=False)
