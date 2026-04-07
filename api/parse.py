@@ -54,7 +54,7 @@ _request_cache = {}
 _cache_expiry = 3600  # 1 hour
 
 def get_cache_key(text: str) -> str:
-    """Generate cache key from text hash."""
+    """ Generate cache key from text hash."""
     return hashlib.md5(text[:1000].encode()).hexdigest()
 
 def get_cached_result(text: str):
@@ -70,7 +70,7 @@ def get_cached_result(text: str):
     return None
 
 def cache_result(text: str, data):
-    """Cache parsing result."""
+    """ Cache parsing result."""
     key = get_cache_key(text)
     _request_cache[key] = (time.time(), data)
 
