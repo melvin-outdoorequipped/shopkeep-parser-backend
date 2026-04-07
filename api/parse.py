@@ -625,15 +625,11 @@ def parse_document():
         items = parse_with_gemini(extracted_text)
         
         logger.info(f"Successfully parsed {len(items)} items")
-        return jsonify({'items': items, 'raw_text': extracted_text[:3000]})  # Limit raw text
+        return jsonify({'items': items, 'raw_text': extracted_text[:5000]})  # Limit raw text
         
     except Exception as e:
         logger.exception("Parsing failed")
-        error_msg = str(e)
-        # Return 429 for quota errors so frontend can show better message
-        if "429" in error_msg or "quota" in error_msg.lower():
-            return jsonify({'error': error_msg}), 429
-        return jsonify({'error': error_msg}), 500
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/health', methods=['GET', 'OPTIONS'])
 def health():
@@ -643,8 +639,7 @@ def health():
         'status': 'healthy', 
         'backend': 'available', 
         'model': MODEL_NAME or "MOCK",
-        'ocr_available': ocr_reader is not None,
-        'quota_remaining': MODEL_QUOTA_REMAINING
+        'ocr_available': ocr_reader is not None
     })
 
 if __name__ == '__main__':
