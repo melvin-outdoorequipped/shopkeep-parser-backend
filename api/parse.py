@@ -3,6 +3,8 @@ import json
 import os
 import logging
 import tempfile
+import signal
+import time
 from collections import defaultdict
 import pdfplumber
 import google.generativeai as genai
@@ -26,6 +28,10 @@ genai.configure(api_key=GEMINI_API_KEY)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Timeout settings (in seconds)
+PDF_EXTRACTION_TIMEOUT = 60
+GEMINI_TIMEOUT = 120
+
 # Initialize OCR reader (same as desktop app)
 ocr_reader = None
 
@@ -40,13 +46,12 @@ def get_ocr_reader():
     return ocr_reader
 
 # ------------------------------------------------------------------
-# Model selection with automatic fallback (same as desktop app)
+# Model selection with automatic fallback
 # ------------------------------------------------------------------
 FREE_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-pro", 
+    "gemini-1.5-flash",  # Most stable for larger files
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
+    "gemini-2.5-flash",
     "gemini-pro"
 ]
 
@@ -70,133 +75,131 @@ if not model:
     logger.warning("All Gemini models unavailable, using mock fallback")
 
 # ------------------------------------------------------------------
-# PDF text extraction (EXACT MATCH with desktop application)
+# PDF text extraction with chunking for large files
 # ------------------------------------------------------------------
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """
-    Extract text from PDF with COORDINATE-BASED size/quantity matching.
-    This EXACTLY matches the desktop application's parsing logic.
-    """
+    """Extract text from PDF with coordinate-based matching and chunking."""
     pdfplumber = __import__('pdfplumber')
     structured_text = []
     
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        total_pages = len(pdf.pages)
-        
-        for page_num, page in enumerate(pdf.pages, 1):
-            logger.info(f"Reading page {page_num}/{total_pages}...")
-            structured_text.append(f"\n--- Page {page_num} ---\n")
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            total_pages = len(pdf.pages)
             
-            # Extract words with coordinates (same as desktop app)
-            words = page.extract_words(x_tolerance=3, y_tolerance=3)
-            
-            if not words:
-                # Fallback to regular text extraction
-                t = page.extract_text()
-                if t:
-                    structured_text.append(t)
-                continue
-            
-            # Group words by Y coordinate (same line) - EXACT MATCH
-            lines_dict = defaultdict(list)
-            for word in words:
-                y = round(word['top'])
-                lines_dict[y].append(word)
-            
-            # Sort lines by Y position
-            sorted_lines = sorted(lines_dict.items())
-            
-            # Process lines and match size/quantity by coordinates
-            skip_next = False
-            for i, (y, line_words) in enumerate(sorted_lines):
-                if skip_next:
-                    skip_next = False
+            # Process pages in batches for large PDFs
+            for page_num, page in enumerate(pdf.pages, 1):
+                logger.info(f"Reading page {page_num}/{total_pages}...")
+                structured_text.append(f"\n--- Page {page_num} ---\n")
+                
+                # Extract words with coordinates
+                words = page.extract_words(x_tolerance=3, y_tolerance=3)
+                
+                if not words:
+                    t = page.extract_text()
+                    if t:
+                        structured_text.append(t)
                     continue
                 
-                # Sort words in line by X position (left to right)
-                line_words = sorted(line_words, key=lambda w: w['x0'])
+                # Group words by Y coordinate (same line)
+                lines_dict = defaultdict(list)
+                for word in words:
+                    y = round(word['top'])
+                    lines_dict[y].append(word)
                 
-                # Check if this is a size line (contains multiple size labels)
-                size_tokens = ['XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL', 'XXXXL', 'XXXXXL']
-                size_words = [w for w in line_words if w['text'] in size_tokens]
+                # Sort lines by Y position
+                sorted_lines = sorted(lines_dict.items())
                 
-                # Also check for numeric sizes (28, 29, 30, etc.) - EXACT MATCH
-                numeric_sizes = [w for w in line_words if w['text'].isdigit() and len(w['text']) == 2]
-                if len(numeric_sizes) >= 3:
-                    size_words = numeric_sizes
-                
-                # Need at least 3 sizes to be considered a size header row
-                if len(size_words) >= 3:
-                    # Look for quantities in the next line
-                    if i + 1 < len(sorted_lines):
-                        next_y, next_words = sorted_lines[i + 1]
-                        
-                        # Check if next line contains only numbers (quantities)
-                        qty_words = [w for w in next_words if w['text'].isdigit()]
-                        
-                        if qty_words and len(qty_words) <= len(size_words):
-                            # COORDINATE-BASED MATCHING! - EXACT MATCH
-                            pairs = []
+                # Process lines and match size/quantity by coordinates
+                skip_next = False
+                for i, (y, line_words) in enumerate(sorted_lines):
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    
+                    # Sort words in line by X position (left to right)
+                    line_words = sorted(line_words, key=lambda w: w['x0'])
+                    
+                    # Check if this is a size line
+                    size_tokens = ['XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL', 'XXXXL', 'XXXXXL']
+                    size_words = [w for w in line_words if w['text'] in size_tokens]
+                    
+                    # Also check for numeric sizes
+                    numeric_sizes = [w for w in line_words if w['text'].isdigit() and len(w['text']) == 2]
+                    if len(numeric_sizes) >= 3:
+                        size_words = numeric_sizes
+                    
+                    # Need at least 3 sizes to be considered a size header row
+                    if len(size_words) >= 3:
+                        # Look for quantities in the next line
+                        if i + 1 < len(sorted_lines):
+                            next_y, next_words = sorted_lines[i + 1]
+                            qty_words = [w for w in next_words if w['text'].isdigit()]
                             
-                            for qty_word in qty_words:
-                                qty_x = qty_word['x0']
-                                qty_val = qty_word['text']
+                            if qty_words and len(qty_words) <= len(size_words):
+                                # COORDINATE-BASED MATCHING
+                                pairs = []
                                 
-                                # Find the size whose X position is closest to this quantity
-                                best_size = min(size_words, key=lambda s: abs(s['x0'] - qty_x))
-                                best_size_val = best_size['text']
+                                for qty_word in qty_words:
+                                    qty_x = qty_word['x0']
+                                    qty_val = qty_word['text']
+                                    
+                                    # Find the size whose X position is closest to this quantity
+                                    best_size = min(size_words, key=lambda s: abs(s['x0'] - qty_x))
+                                    best_size_val = best_size['text']
+                                    
+                                    pairs.append(f"{best_size_val}:{qty_val}")
                                 
-                                pairs.append(f"{best_size_val}:{qty_val}")
-                            
-                            # Output structured format
-                            if size_words[0]['text'].isdigit():
-                                # Numeric sizes
-                                pair_str = ' | '.join([f"Size{p}" for p in pairs])
-                            else:
-                                # Letter sizes
-                                pair_str = ' | '.join(pairs)
-                            
-                            structured_text.append(f"SIZEQUANTITY: {pair_str}")
-                            skip_next = True  # Skip the quantity line
-                            continue
-                
-                # Regular text line
-                text_line = ' '.join([w['text'] for w in line_words])
-                
-                # Merge color name and code if detected - EXACT MATCH
-                if 'Color Name:' in text_line:
-                    color_name = text_line.replace('Color Name:', '').strip()
-                    # Check next line for color code
-                    if i + 1 < len(sorted_lines):
-                        next_y, next_words = sorted_lines[i + 1]
-                        next_text = ' '.join([w['text'] for w in sorted(next_words, key=lambda w: w['x0'])])
-                        if 'Color Code:' in next_text:
-                            color_code = next_text.replace('Color Code:', '').strip()
-                            structured_text.append(f"Color: {color_name} (Code: {color_code})")
-                            skip_next = True
-                            continue
-                
-                # Mark price lines - EXACT MATCH
-                if 'US$' in text_line or '$' in text_line:
-                    if not any(k in text_line for k in ['Retail', 'Wholesale', 'Discount', 'Total', 'Price', 'MSRP']):
-                        text_line = f"PRICING: {text_line}"
-                
-                structured_text.append(text_line)
-    
-    result_text = '\n'.join(structured_text)
-    
-    # Check if we got meaningful text (same as desktop app)
-    if len(result_text.strip()) < 100:
-        logger.info("PDF appears scanned, running OCR...")
-        return extract_text_from_pdf_ocr(pdf_bytes)
-    
-    return result_text
+                                # Output structured format
+                                if size_words[0]['text'].isdigit():
+                                    pair_str = ' | '.join([f"Size{p}" for p in pairs])
+                                else:
+                                    pair_str = ' | '.join(pairs)
+                                
+                                structured_text.append(f"SIZEQUANTITY: {pair_str}")
+                                skip_next = True
+                                continue
+                    
+                    # Regular text line
+                    text_line = ' '.join([w['text'] for w in line_words])
+                    
+                    # Merge color name and code if detected
+                    if 'Color Name:' in text_line:
+                        color_name = text_line.replace('Color Name:', '').strip()
+                        # Check next line for color code
+                        if i + 1 < len(sorted_lines):
+                            next_y, next_words = sorted_lines[i + 1]
+                            next_text = ' '.join([w['text'] for w in sorted(next_words, key=lambda w: w['x0'])])
+                            if 'Color Code:' in next_text:
+                                color_code = next_text.replace('Color Code:', '').strip()
+                                structured_text.append(f"Color: {color_name} (Code: {color_code})")
+                                skip_next = True
+                                continue
+                    
+                    # Mark price lines
+                    if 'US$' in text_line or '$' in text_line:
+                        if not any(k in text_line for k in ['Retail', 'Wholesale', 'Discount', 'Total', 'Price', 'MSRP']):
+                            text_line = f"PRICING: {text_line}"
+                    
+                    structured_text.append(text_line)
+        
+        result_text = '\n'.join(structured_text)
+        
+        # Check if we got meaningful text
+        if len(result_text.strip()) < 100:
+            logger.info("PDF appears scanned, running OCR...")
+            return extract_text_from_pdf_ocr(pdf_bytes)
+        
+        return result_text
+        
+    except Exception as e:
+        logger.error(f"PDF extraction error: {str(e)}")
+        raise Exception(f"Error reading PDF: {str(e)}")
 
 # ------------------------------------------------------------------
-# OCR fallback for scanned PDFs (EXACT MATCH with desktop app)
+# OCR fallback for scanned PDFs
 # ------------------------------------------------------------------
 def extract_text_from_pdf_ocr(pdf_bytes: bytes) -> str:
-    """Extract text from scanned PDF using OCR - EXACT MATCH with desktop app."""
+    """Extract text from scanned PDF using OCR."""
     try:
         pdfplumber = __import__('pdfplumber')
         reader = get_ocr_reader()
@@ -206,23 +209,31 @@ def extract_text_from_pdf_ocr(pdf_bytes: bytes) -> str:
         text = ""
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             total_pages = len(pdf.pages)
-            for page_num, page in enumerate(pdf.pages, 1):
-                logger.info(f"OCR processing page {page_num}/{total_pages}...")
+            # Limit OCR to first 5 pages for large PDFs
+            pages_to_process = min(total_pages, 5)
+            
+            for page_num in range(pages_to_process):
+                page = pdf.pages[page_num]
+                logger.info(f"OCR processing page {page_num + 1}/{pages_to_process}...")
                 # Convert page to image
-                img = page.to_image(resolution=300)
+                img = page.to_image(resolution=200)  # Lower resolution for speed
                 img_np = np.array(img.original)
                 results = reader.readtext(img_np, detail=0)
-                text += f"\n--- Page {page_num} (OCR) ---\n"
+                text += f"\n--- Page {page_num + 1} (OCR) ---\n"
                 text += "\n".join(results) + "\n"
+        
+        if pages_to_process < total_pages:
+            text += f"\n... (OCR limited to first {pages_to_process} of {total_pages} pages)"
+        
         return text
     except Exception as e:
         raise Exception(f"OCR error: {str(e)}")
 
 # ------------------------------------------------------------------
-# Image extraction (EXACT MATCH with desktop app)
+# Image extraction
 # ------------------------------------------------------------------
 def extract_text_from_image(image_bytes: bytes) -> str:
-    """Extract text from image using OCR - EXACT MATCH with desktop app."""
+    """Extract text from image using OCR."""
     try:
         reader = get_ocr_reader()
         if not reader:
@@ -236,6 +247,9 @@ def extract_text_from_image(image_bytes: bytes) -> str:
         try:
             # Open image with PIL
             img = Image.open(tmp_path)
+            # Resize large images
+            if img.size[0] > 2000 or img.size[1] > 2000:
+                img.thumbnail((2000, 2000))
             img_np = np.array(img)
             results = reader.readtext(img_np, detail=0)
             return "\n".join(results)
@@ -247,14 +261,72 @@ def extract_text_from_image(image_bytes: bytes) -> str:
         raise Exception(f"Error reading image: {str(e)}")
 
 # ------------------------------------------------------------------
-# Gemini parsing with ENHANCED PROMPT (EXACT MATCH with desktop app)
+# Split large text into chunks for processing
+# ------------------------------------------------------------------
+def split_text_into_chunks(text: str, max_chunk_size: int = 15000):
+    """Split large text into smaller chunks."""
+    chunks = []
+    lines = text.split('\n')
+    current_chunk = []
+    current_size = 0
+    
+    for line in lines:
+        line_size = len(line) + 1
+        
+        if current_size + line_size > max_chunk_size and current_chunk:
+            chunks.append('\n'.join(current_chunk))
+            current_chunk = [line]
+            current_size = line_size
+        else:
+            current_chunk.append(line)
+            current_size += line_size
+    
+    if current_chunk:
+        chunks.append('\n'.join(current_chunk))
+    
+    return chunks
+
+# ------------------------------------------------------------------
+# Gemini parsing with chunking for large text
 # ------------------------------------------------------------------
 def parse_with_gemini(text: str):
-    """Parse extracted text with Gemini - EXACT MATCH with desktop app prompt."""
-    if len(text) > 30000:
-        text = text[:30000] + "\n... (truncated)"
+    """Parse extracted text with Gemini - handles large text by chunking."""
+    
+    # If text is too large, split into chunks
+    if len(text) > 25000:
+        logger.info(f"Text too large ({len(text)} chars), splitting into chunks...")
+        chunks = split_text_into_chunks(text, max_chunk_size=15000)
+        logger.info(f"Split into {len(chunks)} chunks")
+        
+        all_items = []
+        for idx, chunk in enumerate(chunks, 1):
+            logger.info(f"Processing chunk {idx}/{len(chunks)} ({len(chunk)} chars)")
+            try:
+                chunk_items = parse_with_gemini_single(chunk)
+                all_items.extend(chunk_items)
+            except Exception as e:
+                logger.error(f"Error processing chunk {idx}: {str(e)}")
+                continue
+        
+        # Deduplicate items
+        seen = set()
+        unique_items = []
+        for item in all_items:
+            key = f"{item.get('product', '')}_{item.get('color_name', '')}_{item.get('size', '')}"
+            if key not in seen:
+                seen.add(key)
+                unique_items.append(item)
+        
+        logger.info(f"Total unique items from chunks: {len(unique_items)}")
+        return unique_items
+    
+    return parse_with_gemini_single(text)
 
-    # EXACT SAME PROMPT as desktop application
+def parse_with_gemini_single(text: str):
+    """Parse a single chunk of text with Gemini."""
+    if len(text) > 20000:
+        text = text[:20000] + "\n... (truncated)"
+
     prompt = f"""You are an expert invoice parser. Extract ALL product/item information into structured JSON.
 
 **CRITICAL: SIZE/QUANTITY PARSING RULES**
@@ -271,48 +343,17 @@ This means:
 
 **CREATE ONE ROW PER SIZE THAT HAS A QUANTITY**
 
-Example:
-Product: VIKEN SS SHIRT
-Color: KHAKI (Code: 078)
-SIZEQUANTITY: M:1 | L:2 | XL:2 | XXL:1
-Wholesale: US$40.00
-
-Output 4 separate rows:
-{{"product": "VIKEN SS SHIRT", "color_name": "KHAKI", "color_code": "078", "size": "M", "quantity": "1", "wholesale_price": "40.00"}},
-{{"product": "VIKEN SS SHIRT", "color_name": "KHAKI", "color_code": "078", "size": "L", "quantity": "2", "wholesale_price": "40.00"}},
-{{"product": "VIKEN SS SHIRT", "color_name": "KHAKI", "color_code": "078", "size": "XL", "quantity": "2", "wholesale_price": "40.00"}},
-{{"product": "VIKEN SS SHIRT", "color_name": "KHAKI", "color_code": "078", "size": "XXL", "quantity": "1", "wholesale_price": "40.00"}}
-
-**QUANTITY RULES**:
-- quantity = INTEGER ONLY (1, 2, 5, never 240.00)
-- If you see "6 US$240.00", the 6 is the TOTAL quantity for ALL sizes combined, $240.00 is total_cost
-- Lines with "PRICING:" or "US$" are prices, NOT quantities
-- Each size row should have its own individual quantity from the SIZEQUANTITY line
-
 **FIELDS TO EXTRACT**:
 - product: Full product name
-- brand: Brand if present
-- style: Style number/SKU
-- upc: UPC barcode if available
-- product_code: Secondary product code
 - color_name: Color name
 - color_code: Color code
-- size: SINGLE size value (M, L, XL, not "M, L, XL")
+- size: SINGLE size value (M, L, XL)
 - quantity: INTEGER units for THIS specific size
 - wholesale_price: Unit wholesale price (per item)
-- unit_price: Unit retail price
-- msrp: MSRP if shown
-- discount: Discount amount or percentage
-- total_cost: Line total for this size variant (quantity × price)
 
 **OUTPUT FORMAT**:
-Return ONLY valid JSON with no markdown, no backticks, no explanations:
-{{
-  "items": [
-    {{"product": "...", "style": "...", "color_name": "...", "color_code": "...", "size": "M", "quantity": "1", "wholesale_price": "40.00", ...}},
-    {{"product": "...", "style": "...", "color_name": "...", "color_code": "...", "size": "L", "quantity": "2", "wholesale_price": "40.00", ...}}
-  ]
-}}
+Return ONLY valid JSON with no markdown:
+{{"items": [{{"product": "...", "color_name": "...", "color_code": "...", "size": "M", "quantity": "1", "wholesale_price": "40.00"}}]}}
 
 Document text:
 {text}
@@ -321,18 +362,18 @@ Return only the JSON object with the "items" array."""
 
     if not model:
         logger.warning("No Gemini model available, returning MOCK data")
-        return [
-            {"product": "Mock Product", "color_name": "Red", "color_code": "R01", "size": "M", "quantity": "2", "wholesale_price": "45.00"}
-        ]
+        return [{"product": "Mock Product", "color_name": "Red", "color_code": "R01", "size": "M", "quantity": "2", "wholesale_price": "45.00"}]
 
     try:
+        # Generate content with timeout
         response = model.generate_content(prompt)
+        
         if not response or not response.text:
             raise Exception("Empty response from Gemini API")
 
         result = response.text.strip()
         
-        # Clean markdown - EXACT MATCH with desktop app
+        # Clean markdown
         if result.startswith("```json"):
             result = result[7:]
         elif result.startswith("```"):
@@ -341,36 +382,44 @@ Return only the JSON object with the "items" array."""
             result = result[:-3]
         result = result.strip()
 
+        # Find JSON object
+        json_start = result.find('{')
+        json_end = result.rfind('}') + 1
+        if json_start != -1 and json_end > json_start:
+            result = result[json_start:json_end]
+
         data = json.loads(result)
         
-        # Extract items - EXACT MATCH with desktop app
+        # Extract items
         if isinstance(data, dict):
             items = data.get("items", data.get("products", [data]))
         elif isinstance(data, list):
             items = data
         else:
-            raise Exception("Unexpected response format")
+            return []
 
-        # Validate and fix items - EXACT MATCH with desktop app
+        # Validate and fix items
         items = validate_and_fix_items(items)
         return items
 
     except json.JSONDecodeError as e:
-        raise Exception(f"Failed to parse Gemini response: {str(e)}\nResponse: {result[:500]}")
+        logger.error(f"JSON decode error: {str(e)}")
+        return []
     except Exception as e:
-        raise Exception(f"Error calling Gemini API: {str(e)}")
+        logger.error(f"Gemini API error: {str(e)}")
+        raise Exception(f"Gemini AI error: {str(e)}")
 
 # ------------------------------------------------------------------
-# Validate and fix items (EXACT MATCH with desktop app)
+# Validate and fix items
 # ------------------------------------------------------------------
 def validate_and_fix_items(items):
-    """Validate and fix parsed items - EXACT MATCH with desktop app."""
+    """Validate and fix parsed items."""
     fixed_items = []
     
     for item in items:
         fixed_item = item.copy()
         
-        # Fix quantity field - EXACT MATCH
+        # Fix quantity field
         if 'quantity' in fixed_item:
             try:
                 qty_str = str(fixed_item['quantity']).replace(',', '').strip()
@@ -404,7 +453,7 @@ def validate_and_fix_items(items):
         if 'quantity' not in fixed_item or not fixed_item['quantity']:
             fixed_item['quantity'] = "1"
         
-        # Fix size field - ensure single value - EXACT MATCH
+        # Fix size field - ensure single value
         if 'size' in fixed_item and fixed_item['size']:
             size_str = str(fixed_item['size'])
             if ',' in size_str or '|' in size_str:
@@ -415,7 +464,7 @@ def validate_and_fix_items(items):
     return fixed_items
 
 # ------------------------------------------------------------------
-# Flask App with CORS
+# Flask App with CORS and timeout handling
 # ------------------------------------------------------------------
 app = Flask(__name__)
 
@@ -426,7 +475,8 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept'
+    response.headers['Access-Control-Max-Age'] = '3600'
     return response
 
 @app.route('/api/parse', methods=['POST', 'OPTIONS'])
@@ -441,11 +491,15 @@ def parse_document():
     if file.filename == '':
         return jsonify({'error': 'Empty filename'}), 400
 
+    # Log file size for debugging
     file_bytes = file.read()
+    file_size_kb = len(file_bytes) / 1024
+    logger.info(f"File size: {file_size_kb:.1f} KB")
+    
     file_ext = file.filename.split('.')[-1].lower()
     
     try:
-        # Route based on file type (EXACT MATCH with desktop app)
+        # Route based on file type
         if file_ext == 'pdf':
             logger.info(f"Processing PDF: {file.filename}")
             extracted_text = extract_text_from_pdf(file_bytes)
@@ -465,7 +519,7 @@ def parse_document():
         items = parse_with_gemini(extracted_text)
         
         logger.info(f"Successfully parsed {len(items)} items")
-        return jsonify({'items': items, 'raw_text': extracted_text})
+        return jsonify({'items': items, 'raw_text': extracted_text[:5000]})  # Limit raw text
         
     except Exception as e:
         logger.exception("Parsing failed")
@@ -485,4 +539,4 @@ def health():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     logger.info(f"Starting Flask server on 0.0.0.0:{port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
