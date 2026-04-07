@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 from PIL import Image
 import easyocr
 import numpy as np
+from datetime import datetime, timedelta
+import hashlib
 
 load_dotenv()
 
@@ -46,33 +48,95 @@ def get_ocr_reader():
     return ocr_reader
 
 # ------------------------------------------------------------------
-# Model selection with automatic fallback
+# Simple Request Cache (prevents duplicate API calls)
 # ------------------------------------------------------------------
-FREE_MODELS = [
-    "gemini-1.5-flash",  # Most stable for larger files
-    "gemini-2.0-flash",
-    "gemini-2.5-flash",
-    "gemini-pro"
+_request_cache = {}
+_cache_expiry = 3600  # 1 hour
+
+def get_cache_key(text: str) -> str:
+    """Generate cache key from text hash."""
+    return hashlib.md5(text[:1000].encode()).hexdigest()
+
+def get_cached_result(text: str):
+    """Get cached parsing result if available."""
+    key = get_cache_key(text)
+    if key in _request_cache:
+        cached_time, cached_data = _request_cache[key]
+        if time.time() - cached_time < _cache_expiry:
+            logger.info("✅ Using cached result")
+            return cached_data
+        else:
+            del _request_cache[key]
+    return None
+
+def cache_result(text: str, data):
+    """Cache parsing result."""
+    key = get_cache_key(text)
+    _request_cache[key] = (time.time(), data)
+
+# ------------------------------------------------------------------
+# Model selection with automatic fallback & quota awareness
+# ------------------------------------------------------------------
+# Models ordered by quota limits (free tier most restrictive)
+MODEL_CONFIGS = [
+    {"name": "gemini-1.5-flash", "quota": 20, "delay": 3},  # Free tier: 20 req/day
+    {"name": "gemini-2.0-flash", "quota": 20, "delay": 3},
+    {"name": "gemini-2.5-flash", "quota": 20, "delay": 3},
+    {"name": "gemini-pro", "quota": 50, "delay": 2},
 ]
 
 model = None
 MODEL_NAME = None
+MODEL_QUOTA_REMAINING = 20
+LAST_REQUEST_TIME = None
 
-for candidate in FREE_MODELS:
-    try:
-        tmp_model = genai.GenerativeModel(candidate)
-        # Test call to see if free quota is available
-        resp = tmp_model.generate_content("Hello")
-        if resp and resp.text:
-            model = tmp_model
-            MODEL_NAME = candidate
-            logger.info(f"✅ Using model: {MODEL_NAME}")
-            break
-    except Exception as e:
-        logger.warning(f"{candidate} unavailable: {e}")
+def select_model():
+    """Select best available model with quota awareness."""
+    global model, MODEL_NAME, MODEL_QUOTA_REMAINING
+    
+    for config in MODEL_CONFIGS:
+        try:
+            candidate = config["name"]
+            logger.info(f"Attempting to initialize {candidate}...")
+            tmp_model = genai.GenerativeModel(candidate)
+            
+            # Light test call
+            resp = tmp_model.generate_content("OK")
+            if resp and resp.text:
+                model = tmp_model
+                MODEL_NAME = candidate
+                MODEL_QUOTA_REMAINING = config["quota"]
+                logger.info(f"✅ Using model: {MODEL_NAME} (quota: {MODEL_QUOTA_REMAINING}/day)")
+                return True
+        except Exception as e:
+            logger.warning(f"❌ {config['name']} unavailable: {str(e)[:100]}")
+            continue
+    
+    logger.warning("⚠️  All Gemini models unavailable - using MOCK mode")
+    return False
 
-if not model:
-    logger.warning("All Gemini models unavailable, using mock fallback")
+def handle_quota_error(error_str: str) -> tuple[bool, int]:
+    """
+    Handle quota exceeded errors.
+    Returns (should_retry, wait_seconds)
+    """
+    if "429" in str(error_str) or "quota" in str(error_str).lower():
+        # Extract retry delay if available
+        if "retry" in error_str.lower():
+            try:
+                # Look for "retry in X seconds" pattern
+                import re
+                match = re.search(r'retry[^0-9]*(\d+\.?\d*)', error_str, re.IGNORECASE)
+                if match:
+                    wait = max(int(float(match.group(1))) + 2, 30)
+                    logger.warning(f"⚠️  Rate limited. Waiting {wait}s before retry...")
+                    return True, wait
+            except:
+                pass
+        return True, 30  # Default 30 second wait
+    return False, 0
+
+select_model()
 
 # ------------------------------------------------------------------
 # PDF text extraction with chunking for large files
@@ -86,10 +150,15 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             total_pages = len(pdf.pages)
             
-            # Process pages in batches for large PDFs
-            for page_num, page in enumerate(pdf.pages, 1):
-                logger.info(f"Reading page {page_num}/{total_pages}...")
-                structured_text.append(f"\n--- Page {page_num} ---\n")
+            # Limit to first 10 pages for large PDFs (to reduce API calls)
+            pages_to_process = min(total_pages, 10)
+            if pages_to_process < total_pages:
+                logger.info(f"⚠️  Large PDF ({total_pages} pages), limiting to first {pages_to_process}")
+            
+            for page_num in range(pages_to_process):
+                page = pdf.pages[page_num]
+                logger.info(f"Reading page {page_num + 1}/{pages_to_process}...")
+                structured_text.append(f"\n--- Page {page_num + 1} ---\n")
                 
                 # Extract words with coordinates
                 words = page.extract_words(x_tolerance=3, y_tolerance=3)
@@ -209,14 +278,14 @@ def extract_text_from_pdf_ocr(pdf_bytes: bytes) -> str:
         text = ""
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             total_pages = len(pdf.pages)
-            # Limit OCR to first 5 pages for large PDFs
-            pages_to_process = min(total_pages, 5)
+            # Limit OCR to first 3 pages for large PDFs
+            pages_to_process = min(total_pages, 3)
             
             for page_num in range(pages_to_process):
                 page = pdf.pages[page_num]
                 logger.info(f"OCR processing page {page_num + 1}/{pages_to_process}...")
                 # Convert page to image
-                img = page.to_image(resolution=200)  # Lower resolution for speed
+                img = page.to_image(resolution=150)  # Lower resolution for speed
                 img_np = np.array(img.original)
                 results = reader.readtext(img_np, detail=0)
                 text += f"\n--- Page {page_num + 1} (OCR) ---\n"
@@ -263,8 +332,8 @@ def extract_text_from_image(image_bytes: bytes) -> str:
 # ------------------------------------------------------------------
 # Split large text into chunks for processing
 # ------------------------------------------------------------------
-def split_text_into_chunks(text: str, max_chunk_size: int = 15000):
-    """Split large text into smaller chunks."""
+def split_text_into_chunks(text: str, max_chunk_size: int = 10000):
+    """Split large text into smaller chunks (smaller for free tier)."""
     chunks = []
     lines = text.split('\n')
     current_chunk = []
@@ -287,25 +356,49 @@ def split_text_into_chunks(text: str, max_chunk_size: int = 15000):
     return chunks
 
 # ------------------------------------------------------------------
-# Gemini parsing with chunking for large text
+# Gemini parsing with chunking, caching, and retry logic
 # ------------------------------------------------------------------
 def parse_with_gemini(text: str):
-    """Parse extracted text with Gemini - handles large text by chunking."""
+    """Parse extracted text with Gemini - handles quota & retries."""
+    global LAST_REQUEST_TIME, MODEL_QUOTA_REMAINING
+    
+    # Check cache first
+    cached = get_cached_result(text)
+    if cached:
+        return cached
+    
+    # Rate limiting for free tier
+    if LAST_REQUEST_TIME:
+        elapsed = time.time() - LAST_REQUEST_TIME
+        min_delay = 2  # Minimum 2 seconds between requests
+        if elapsed < min_delay:
+            wait = min_delay - elapsed
+            logger.info(f"Rate limiting: waiting {wait:.1f}s...")
+            time.sleep(wait)
     
     # If text is too large, split into chunks
-    if len(text) > 25000:
+    if len(text) > 20000:
         logger.info(f"Text too large ({len(text)} chars), splitting into chunks...")
-        chunks = split_text_into_chunks(text, max_chunk_size=15000)
+        chunks = split_text_into_chunks(text, max_chunk_size=10000)
         logger.info(f"Split into {len(chunks)} chunks")
         
         all_items = []
         for idx, chunk in enumerate(chunks, 1):
+            if MODEL_QUOTA_REMAINING <= 1:
+                logger.warning("⚠️  Approaching quota limit, stopping chunked processing")
+                break
+            
             logger.info(f"Processing chunk {idx}/{len(chunks)} ({len(chunk)} chars)")
             try:
                 chunk_items = parse_with_gemini_single(chunk)
                 all_items.extend(chunk_items)
+                MODEL_QUOTA_REMAINING -= 1
+                LAST_REQUEST_TIME = time.time()
             except Exception as e:
                 logger.error(f"Error processing chunk {idx}: {str(e)}")
+                if "429" in str(e) or "quota" in str(e).lower():
+                    logger.error("Quota exceeded, stopping chunk processing")
+                    break
                 continue
         
         # Deduplicate items
@@ -318,14 +411,27 @@ def parse_with_gemini(text: str):
                 unique_items.append(item)
         
         logger.info(f"Total unique items from chunks: {len(unique_items)}")
+        cache_result(text, unique_items)
         return unique_items
     
-    return parse_with_gemini_single(text)
+    # Single request for smaller text
+    try:
+        items = parse_with_gemini_single(text)
+        MODEL_QUOTA_REMAINING -= 1
+        LAST_REQUEST_TIME = time.time()
+        cache_result(text, items)
+        return items
+    except Exception as e:
+        should_retry, wait_time = handle_quota_error(str(e))
+        if should_retry and wait_time > 0:
+            logger.error(f"Rate limited, would need to wait {wait_time}s")
+            raise Exception(f"Rate limited (quota exceeded). Please retry in {wait_time} seconds.")
+        raise
 
 def parse_with_gemini_single(text: str):
     """Parse a single chunk of text with Gemini."""
-    if len(text) > 20000:
-        text = text[:20000] + "\n... (truncated)"
+    if len(text) > 15000:
+        text = text[:15000] + "\n... (truncated)"
 
     prompt = f"""You are an expert invoice parser. Extract ALL product/item information into structured JSON.
 
@@ -365,7 +471,7 @@ Return only the JSON object with the "items" array."""
         return [{"product": "Mock Product", "color_name": "Red", "color_code": "R01", "size": "M", "quantity": "2", "wholesale_price": "45.00"}]
 
     try:
-        # Generate content with timeout
+        # Generate content
         response = model.generate_content(prompt)
         
         if not response or not response.text:
@@ -519,11 +625,15 @@ def parse_document():
         items = parse_with_gemini(extracted_text)
         
         logger.info(f"Successfully parsed {len(items)} items")
-        return jsonify({'items': items, 'raw_text': extracted_text[:5000]})  # Limit raw text
+        return jsonify({'items': items, 'raw_text': extracted_text[:3000]})  # Limit raw text
         
     except Exception as e:
         logger.exception("Parsing failed")
-        return jsonify({'error': str(e)}), 500
+        error_msg = str(e)
+        # Return 429 for quota errors so frontend can show better message
+        if "429" in error_msg or "quota" in error_msg.lower():
+            return jsonify({'error': error_msg}), 429
+        return jsonify({'error': error_msg}), 500
 
 @app.route('/api/health', methods=['GET', 'OPTIONS'])
 def health():
@@ -533,7 +643,8 @@ def health():
         'status': 'healthy', 
         'backend': 'available', 
         'model': MODEL_NAME or "MOCK",
-        'ocr_available': ocr_reader is not None
+        'ocr_available': ocr_reader is not None,
+        'quota_remaining': MODEL_QUOTA_REMAINING
     })
 
 if __name__ == '__main__':
