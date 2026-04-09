@@ -17,6 +17,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import hashlib
 
+# Load environment variables from .env file
 load_dotenv()
 
 # ------------------------------------------------------------------
@@ -136,6 +137,7 @@ def handle_quota_error(error_str: str) -> tuple[bool, int]:
         return True, 30  # Default 30 second wait
     return False, 0
 
+# Initialize model on startup
 select_model()
 
 # ------------------------------------------------------------------
@@ -574,7 +576,7 @@ def validate_and_fix_items(items):
 # ------------------------------------------------------------------
 app = Flask(__name__)
 
-# Allow all origins (for Codespaces)
+# Allow all origins (for Codespaces & Vercel)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 @app.after_request
@@ -633,13 +635,27 @@ def parse_document():
 
 @app.route('/api/health', methods=['GET', 'OPTIONS'])
 def health():
+    """Health check endpoint for Railway/Vercel"""
     if request.method == 'OPTIONS':
         return '', 204
     return jsonify({
         'status': 'healthy', 
         'backend': 'available', 
         'model': MODEL_NAME or "MOCK",
-        'ocr_available': ocr_reader is not None
+        'ocr_available': ocr_reader is not None,
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/', methods=['GET'])
+def root():
+    """Root endpoint - welcome message"""
+    return jsonify({
+        'message': 'ShopKeep Parser Backend',
+        'version': '1.0',
+        'endpoints': {
+            'health': '/api/health',
+            'parse': '/api/parse'
+        }
     })
 
 if __name__ == '__main__':
