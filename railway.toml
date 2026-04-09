@@ -1,13 +1,8 @@
-#!/bin/bash
+[build]
+builder = "NIXPACKS"
 
-# Exit on any error
-set -e
-
-# Move into the app folder
-cd api
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run Flask with Gunicorn (production-ready for Railway)
-gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 4 --timeout 120 --access-logfile - --error-logfile - parse:app
+[deploy]
+# Ensure this matches your script's filename exactly
+startCommand = "bash start.sh"
+healthcheckPath = "/"
+restartPolicyType = "ON_FAILURE"
