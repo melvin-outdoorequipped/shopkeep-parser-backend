@@ -80,10 +80,9 @@ def cache_result(text: str, data):
 # ------------------------------------------------------------------
 # Models ordered by quota limits (free tier most restrictive)
 MODEL_CONFIGS = [
-    {"name": "gemini-1.5-flash", "quota": 20, "delay": 3},  # Free tier: 20 req/day
-    {"name": "gemini-2.0-flash", "quota": 20, "delay": 3},
-    {"name": "gemini-2.5-flash", "quota": 20, "delay": 3},
-    {"name": "gemini-pro", "quota": 50, "delay": 2},
+    {"name": "gemini-1.5-flash", "quota": 20, "delay": 4},  # Free tier: 20 req/day
+    {"name": "gemini-2.0-flash", "quota": 20, "delay": 4},
+    {"name": "gemini-2.5-flash", "quota": 20, "delay": 4},
 ]
 
 model = None
