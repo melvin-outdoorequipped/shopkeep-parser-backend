@@ -1,13 +1,24 @@
 #!/bin/bash
 
-# Exit on any error
+# Exit immediately if a command exits with a non-zero status
 set -e
 
-# Move into the app folder
+# 1. Move into the directory containing your Flask app
+# (Only needed if your 'api' folder isn't the root of the repo)
 cd api
 
-# Install dependencies
-pip install -r requirements.txt
+# 2. Install dependencies 
+# Note: Railway usually does this during the build phase, 
+# but this ensures they are present in the runtime.
+pip install --no-cache-dir -r requirements.txt
 
-# Run Flask with Gunicorn (production-ready for Railway)
-gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 4 --timeout 120 --access-logfile - --error-logfile - parse:app
+# 3. Launch Gunicorn
+# 'parse:app' assumes your file is 'parse.py' and your Flask instance is 'app'
+echo "Starting Gunicorn on port ${PORT:-8080}..."
+
+exec gunicorn --bind 0.0.0.0:${PORT:-8080} \
+     --workers 4 \
+     --timeout 120 \
+     --access-logfile - \
+     --error-logfile - \
+     parse:app
